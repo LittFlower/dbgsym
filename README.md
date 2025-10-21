@@ -1,4 +1,4 @@
-一个根据制定 libc 获取调试信息的小工具。
+一个根据指定 libc 获取调试信息的小工具。
 
 很大程度上参考了[这个项目](https://github.com/veritas501/dl_dbgsym/blob/master/dl_dbgsym.py) 和 ltfa1l 师傅的 exp
 
