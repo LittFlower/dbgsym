@@ -6,254 +6,441 @@ import sys
 from pwn import pause
 
 
-log_info = lambda s: print(f'[\033[1;36m*\033[0m] {s}')
-log_success = lambda s: print(f'[\033[1;32m√\033[0m] {s}')
-log_fail = lambda s: print(f'[\033[1;31m×\033[0m] {s}')
-underline = lambda s: f'\033[4m{s}\033[0m'
+log_info = lambda s: print(f"[\033[1;36m*\033[0m] {s}")
+log_success = lambda s: print(f"[\033[1;32m√\033[0m] {s}")
+log_fail = lambda s: print(f"[\033[1;31m×\033[0m] {s}")
+underline = lambda s: f"\033[4m{s}\033[0m"
 
 
 def set_libc_env(filename):
     def get_data_tar_name(deb_filename):
         output = popen(f'ar t "{deb_filename}"').read()
-        if 'data.tar.xz' in output:
-            return 'data.tar.xz'
-        elif 'data.tar.zst' in output:
-            return 'data.tar.zst'
+        if "data.tar.xz" in output:
+            return "data.tar.xz"
+        elif "data.tar.zst" in output:
+            return "data.tar.zst"
         else:
-            log_fail(f'Unsupported archive format in {deb_filename}')
-            clean()
+            log_fail(f"Unsupported archive format in {deb_filename}")
             exit(1)
 
     def get_arch(filename):
         # FIX: Redirect stderr to hide non-fatal errors
-        data = popen(f'readelf -h "{filename}" 2>/dev/null').read()
-        if 'X86-64' in data:
-            return 'amd64'
-        elif '80386' in data:
-            return 'i386'
-        elif 'ARM' in data:
-            return 'armhf'
-        elif 'AArch64' in data:
-            return 'arm64'
-        elif 'PowerPC64' in data:
-            return 'ppc64el'
-        elif 'IBM S/390' in data:
-            return 's390x'
+        data = popen(f'LANG=C readelf -h "{filename}" 2>/dev/null').read()
+        if "X86-64" in data or "Advanced Micro Devices X86-64" in data:
+            return "amd64"
+        elif "80386" in data:
+            return "i386"
+        elif "ARM" in data:
+            return "armhf"
+        elif "AArch64" in data:
+            return "arm64"
+        elif "PowerPC64" in data:
+            return "ppc64el"
+        elif "IBM S/390" in data:
+            return "s390x"
         else:
-            log_fail(f'unsupported arch')
-            clean()
+            log_fail(f"unsupported arch: {data}")
             exit(1)
 
     def get_ver(filename):
         data = popen(f'strings "{filename}" | grep "GNU C Library"').read()
         try:
-            ver = re.search(r'GLIBC (.*?)\)', data).group(1)
+            ver = re.search(r"GLIBC (.*?)\)", data).group(1)
         except:
-            log_fail(f'can\'t find ubuntu glibc version')
-            clean()
+            log_fail(f"can't find glibc version")
             exit(1)
         return ver
 
     def get_buildid(filename, fatal=True):
         # FIX: Redirect stderr to hide non-fatal errors
-        data = popen(f'readelf --notes "{filename}" 2>/dev/null | grep "Build ID"').read()
-        match = re.search(r'Build ID: (\w+)', data)
+        data = popen(
+            f'readelf --notes "{filename}" 2>/dev/null | grep "Build ID"'
+        ).read()
+        match = re.search(r"Build ID: (\w+)", data)
         if match:
             return match.group(1)
         else:
             if fatal:
                 log_fail(f"can't find buildid for {filename}")
-                clean()
                 exit(1)
             return None
 
-    def find_dist(ver):
-        url = f'https://launchpad.net/ubuntu/+source/glibc/{ver}'
+    def is_debian_version(ver):
+        """Check if this is a Debian version based on version string pattern"""
+        # Debian versions typically contain +deb pattern or don't have ubuntu in them
+        return "+deb" in ver or "ubuntu" not in ver
+
+    def find_debian_dist(ver):
+        """Find Debian distribution name based on version"""
+        if "+deb12" in ver:
+            return "bookworm"  # Debian 12 (oldstable)
+        elif "+deb11" in ver:
+            return "bullseye"  # Debian 11 (oldoldstable)
+        elif "+deb10" in ver:
+            return "buster"  # Debian 10 (archived)
+        elif "+deb9" in ver:
+            return "stretch"  # Debian 9 (archived)
+        else:
+            # For versions without +debX pattern, try to map by version number
+            major_ver = float(ver.split("-")[0])
+            if major_ver >= 2.41:
+                return "sid"  # Debian unstable/testing - current versions
+            elif major_ver >= 2.36:
+                return "bookworm"  # Debian 12 (oldstable)
+            elif major_ver >= 2.31:
+                return "bullseye"  # Debian 11 (oldoldstable)
+            elif major_ver >= 2.28:
+                return "buster"  # Debian 10 (archived)
+            else:
+                return "sid"  # Default to unstable for very old versions
+
+    def find_ubuntu_dist(ver):
+        """Find Ubuntu distribution name - original function"""
+        url = f"https://launchpad.net/ubuntu/+source/glibc/{ver}"
         r = requests.get(url)
         try:
             dist = re.search(r'<a href="/ubuntu/(\w+)">', r.text).group(1)
         except:
-            log_fail(f'can\'t find ubuntu dist')
-            clean()
+            log_fail(f"can't find ubuntu dist")
             exit(1)
         return dist
 
+    def get_debian_package_url(dist, arch, ver, package_name):
+        """Get direct download URL for Debian packages"""
+        # Construct the direct mirror URL
+        base_url = "http://deb.debian.org/debian/pool/main/g/glibc"
+        deb_filename = f"{package_name}_{ver}_{arch}.deb"
+        return f"{base_url}/{deb_filename}"
+
+    def get_debian_dbgsym_url(dist, arch, ver):
+        """Get Debian debug symbol package URL"""
+        # For Debian, debug symbols are in the main repository
+        return get_debian_package_url(dist, arch, ver, "libc6-dbg")
+
     def find_libc_dbg_url(dist, arch, ver):
-        url = f'https://launchpad.net/ubuntu/{dist}/{arch}/libc6-dbg/{ver}'
+        """Ubuntu version - original function"""
+        url = f"https://launchpad.net/ubuntu/{dist}/{arch}/libc6-dbg/{ver}"
         r = requests.get(url)
         try:
             dl_url = re.search(r'<a class="sprite" href="(.*?)">', r.text).group(1)
         except:
-            log_fail(f'can\'t find libc-dbg download url')
-            clean()
+            log_fail(f"can't find libc-dbg download url")
             exit(1)
         return dl_url
 
     def find_libc_dbgsym_url_i386_amd64(dist, arch, ver):
-        url = f'https://launchpad.net/ubuntu/{dist}/amd64/libc6-i386-dbgsym/{ver}'
+        """Ubuntu version - original function"""
+        url = f"https://launchpad.net/ubuntu/{dist}/amd64/libc6-i386-dbgsym/{ver}"
         r = requests.get(url)
         try:
             dl_url = re.search(r'<a class="sprite" href="(.*?)">', r.text).group(1)
         except:
-            log_fail(f'can\'t find libc-dbg download url')
-            clean()
+            log_fail(f"can't find libc-dbg download url")
             exit(1)
         return dl_url
 
     def find_libc_bin_url(dist, arch, ver):
-        url = f'https://launchpad.net/ubuntu/{dist}/{arch}/libc6/{ver}'
+        """Ubuntu version - original function"""
+        url = f"https://launchpad.net/ubuntu/{dist}/{arch}/libc6/{ver}"
         r = requests.get(url)
         try:
             dl_url = re.search(r'<a class="sprite" href="(.*?)">', r.text).group(1)
         except:
-            log_fail(f'can\'t find libc download url')
-            clean()
+            log_fail(f"can't find libc download url")
             exit(1)
         return dl_url
 
     def find_libc_bin_url_i386_amd64(dist, arch, ver):
-        url = f'https://launchpad.net/ubuntu/{dist}/amd64/libc6-i386/{ver}'
+        """Ubuntu version - original function"""
+        url = f"https://launchpad.net/ubuntu/{dist}/amd64/libc6-i386/{ver}"
         r = requests.get(url)
         try:
             dl_url = re.search(r'<a class="sprite" href="(.*?)">', r.text).group(1)
         except:
-            log_fail(f'can\'t find libc download url')
-            clean()
+            log_fail(f"can't find libc download url")
             exit(1)
         return dl_url
 
     def move_dbgysm(filename, buildid):
-        target_dir = f'/usr/lib/debug/.build-id/{buildid[:2]}'
-        target_name = f'/usr/lib/debug/.build-id/{buildid[:2]}/{buildid[2:]}.debug'
-        log_info(f'moving dbgsym for {underline(filename)} to {underline(target_name)}')
-        system(f'sudo mkdir -p {target_dir}')
+        target_dir = f"/usr/lib/debug/.build-id/{buildid[:2]}"
+        target_name = f"/usr/lib/debug/.build-id/{buildid[:2]}/{buildid[2:]}.debug"
+        log_info(f"moving dbgsym for {underline(filename)} to {underline(target_name)}")
+        system(f"sudo mkdir -p {target_dir}")
         system(f'sudo cp "{filename}" "{target_name}"')
         recheck_buildid = get_buildid(target_name)
         if recheck_buildid != buildid:
-            log_fail(f'move dbgsym fail')
-            clean()
+            log_fail(f"move dbgsym fail")
             exit(1)
-        log_success(f'move dbgsym done!!')
+        log_success(f"move dbgsym done!!")
 
-    def clean():
-        log_info(f'cleaning...')
-        system(f'cd ..;rm -rf "{version}_tmp"')
+    def clean(version_name):
+        log_info(f"cleaning...")
+        system(f'cd ..;rm -rf "{version_name}_tmp"')
 
     arch = get_arch(filename)
-    log_info(f'find libc arch: {underline(arch)}')
+    log_info(f"find libc arch: {underline(arch)}")
     version = get_ver(filename)
-    log_info(f'find libc version: {underline(version)}')
+    log_info(f"find libc version: {underline(version)}")
     buildid = get_buildid(filename)
-    log_info(f'find libc buildid: {underline(buildid)}')
-    dist = find_dist(version)
-    log_info(f'find ubuntu dist: {underline(dist)}')
+    log_info(f"find libc buildid: {underline(buildid)}")
+
+    # Determine if this is Debian or Ubuntu
+    is_debian = is_debian_version(version)
+
+    if is_debian:
+        log_info(f"detected Debian glibc version")
+        dist = find_debian_dist(version)
+        log_info(f"find debian dist: {underline(dist)}")
+    else:
+        log_info(f"detected Ubuntu glibc version")
+        dist = find_ubuntu_dist(version)
+        log_info(f"find ubuntu dist: {underline(dist)}")
+
     system(f'rm -rf "{version}_tmp"')
     system(f'mkdir -p "{version}_tmp"')
-    chdir(f'{version}_tmp')
+    chdir(f"{version}_tmp")
 
     amd64_ver_i386 = False
-    libc_dbg_url = find_libc_dbg_url(dist, arch, version)
-    log_info(f'find libc-dbg url: {underline(libc_dbg_url)}')
-    system(f'wget -q --show-progress {libc_dbg_url} -O libc6-dbg.deb')
 
-    data_tar_name = get_data_tar_name('libc6-dbg.deb')
-    system(f'ar -x libc6-dbg.deb {data_tar_name}')
-    system(f'mkdir -p libc6-dbg')
+    # Get debug symbols package
+    if is_debian:
+        libc_dbg_url = get_debian_dbgsym_url(dist, arch, version)
+    else:
+        libc_dbg_url = find_libc_dbg_url(dist, arch, version)
 
-    if data_tar_name == 'data.tar.xz':
-        system(f'tar -xf {data_tar_name} -C ./libc6-dbg')
-    elif data_tar_name == 'data.tar.zst':
-        system(f'zstd -d data.tar.zst -o data_dbg.tar')
-        system(f'tar -xf data_dbg.tar -C ./libc6-dbg')
+    log_info(f"find libc-dbg url: {underline(libc_dbg_url)}")
+
+    # Try to download the debug package
+    download_result = system(f"wget -q --show-progress {libc_dbg_url} -O libc6-dbg.deb")
+
+    if download_result != 0:
+        if is_debian:
+            log_fail(
+                f"failed to download Debian debug package, trying alternative mirrors and distributions..."
+            )
+            # Try alternative mirrors and distributions for Debian
+            mirrors_and_dists = [
+                ("http://ftp.debian.org/debian/pool/main/g/glibc", dist),
+                (
+                    "http://security.debian.org/debian-security/pool/updates/main/g/glibc",
+                    dist,
+                ),
+                # If the current dist fails, try sid (unstable) for newer versions
+                ("http://deb.debian.org/debian/pool/main/g/glibc", "sid"),
+                ("http://ftp.debian.org/debian/pool/main/g/glibc", "sid"),
+                # Try trixie (testing) as well
+                ("http://deb.debian.org/debian/pool/main/g/glibc", "trixie"),
+                ("http://ftp.debian.org/debian/pool/main/g/glibc", "trixie"),
+                # Try snapshot.debian.org for older versions
+                (
+                    "https://snapshot.debian.org/archive/debian/20250618T082426Z/pool/main/g/glibc",
+                    "snapshot",
+                ),
+            ]
+            for mirror, try_dist in mirrors_and_dists:
+                alt_url = f"{mirror}/libc6-dbg_{version}_{arch}.deb"
+                log_info(f"trying mirror ({try_dist}): {underline(alt_url)}")
+                if system(f"wget -q --show-progress {alt_url} -O libc6-dbg.deb") == 0:
+                    break
+            else:
+                log_fail(f"failed to download from all mirrors and distributions")
+                log_info(
+                    f"Note: Version {version} might not be available in any current Debian repository"
+                )
+                log_info(
+                    f"Consider using a different libc version or manually checking https://snapshot.debian.org/"
+                )
+                clean(version)
+                exit(1)
+        else:
+            log_fail(f"failed to download Ubuntu debug package")
+            clean()
+            exit(1)
+
+    data_tar_name = get_data_tar_name("libc6-dbg.deb")
+    system(f"ar -x libc6-dbg.deb {data_tar_name}")
+    system(f"mkdir -p libc6-dbg")
+
+    if data_tar_name == "data.tar.xz":
+        system(f"tar -xf {data_tar_name} -C ./libc6-dbg")
+    elif data_tar_name == "data.tar.zst":
+        system(f"zstd -d data.tar.zst -o data_dbg.tar")
+        system(f"tar -xf data_dbg.tar -C ./libc6-dbg")
 
     dbg_search_dir = "libc6-dbg"
-    dbgsym_filename = popen(f'find {dbg_search_dir} -name "libc-*.so" -or -name "{buildid[2:]}.debug" -type f | grep -v prof').read().strip()
+    dbgsym_filename = (
+        popen(
+            f'find {dbg_search_dir} -name "libc-*.so" -or -name "{buildid[2:]}.debug" -type f | grep -v prof'
+        )
+        .read()
+        .strip()
+    )
     dbg_buildid = get_buildid(dbgsym_filename)
     if dbg_buildid != buildid:
-        log_fail(f'dbgsym buildid not match: {underline(dbg_buildid)}')
-        if arch != 'i386':
+        log_fail(f"dbgsym buildid not match: {underline(dbg_buildid)}")
+        if arch != "i386":
             clean()
             exit(1)
         else:
-            log_info(f'try to fetch amd64 build version of libc6-i386-dbgsym')
-            libc_dbgsym_url = find_libc_dbgsym_url_i386_amd64(dist, arch, version)
-            log_info(f'find libc6-i386-dbgsym url: {underline(libc_dbgsym_url)}')
-            system(f'wget -q --show-progress {libc_dbgsym_url} -O libc6-i386-dbgsym.ddeb')
+            log_info(f"try to fetch amd64 build version of libc6-i386-dbgsym")
+            if is_debian:
+                # For Debian, try the i386 package on amd64
+                libc_dbgsym_url = get_debian_package_url(
+                    dist, "amd64", version, "libc6-i386"
+                )
+            else:
+                libc_dbgsym_url = find_libc_dbgsym_url_i386_amd64(dist, arch, version)
 
-            data_tar_name = get_data_tar_name('libc6-i386-dbgsym.ddeb')
-            system(f'ar -x libc6-i386-dbgsym.ddeb {data_tar_name}')
-            system(f'mkdir -p libc6-i386-dbgsym')
+            log_info(f"find libc6-i386-dbgsym url: {underline(libc_dbgsym_url)}")
+            system(
+                f"wget -q --show-progress {libc_dbgsym_url} -O libc6-i386-dbgsym.ddeb"
+            )
+
+            data_tar_name = get_data_tar_name("libc6-i386-dbgsym.ddeb")
+            system(f"ar -x libc6-i386-dbgsym.ddeb {data_tar_name}")
+            system(f"mkdir -p libc6-i386-dbgsym")
             dbg_search_dir = "libc6-i386-dbgsym"
-            if data_tar_name == 'data.tar.xz':
-                system(f'tar -xf {data_tar_name} -C ./{dbg_search_dir}')
-            elif data_tar_name == 'data.tar.zst':
-                system(f'zstd -d data.tar.zst -o data.tar')
-                system(f'tar -xf data.tar -C ./{dbg_search_dir}')
+            if data_tar_name == "data.tar.xz":
+                system(f"tar -xf {data_tar_name} -C ./{dbg_search_dir}")
+            elif data_tar_name == "data.tar.zst":
+                system(f"zstd -d data.tar.zst -o data.tar")
+                system(f"tar -xf data.tar -C ./{dbg_search_dir}")
 
-            dbgsym_filename = popen(f'find {dbg_search_dir} -name "{buildid[2:]}.debug" -type f').read().strip()
+            dbgsym_filename = (
+                popen(f'find {dbg_search_dir} -name "{buildid[2:]}.debug" -type f')
+                .read()
+                .strip()
+            )
             dbg_buildid = get_buildid(dbgsym_filename)
             if dbg_buildid != buildid:
-                log_fail(f'dbgsym buildid not match: {underline(dbg_buildid)}')
+                log_fail(f"dbgsym buildid not match: {underline(dbg_buildid)}")
                 clean()
                 exit(1)
             amd64_ver_i386 = True
 
-    log_success(f'find libc dbgsym!!')
+    log_success(f"find libc dbgsym!!")
     move_dbgysm(dbgsym_filename, dbg_buildid)
 
-    if amd64_ver_i386:
-        libc_bin_url = find_libc_bin_url_i386_amd64(dist, arch, version)
+    # Get the main libc6 package
+    if is_debian:
+        if amd64_ver_i386:
+            libc_bin_url = get_debian_package_url(dist, "amd64", version, "libc6-i386")
+        else:
+            libc_bin_url = get_debian_package_url(dist, arch, version, "libc6")
     else:
-        libc_bin_url = find_libc_bin_url(dist, arch, version)
-    log_info(f'find libc-bin url: {underline(libc_bin_url)}')
-    system(f'wget -q --show-progress {libc_bin_url} -O libc6.deb')
+        if amd64_ver_i386:
+            libc_bin_url = find_libc_bin_url_i386_amd64(dist, arch, version)
+        else:
+            libc_bin_url = find_libc_bin_url(dist, arch, version)
 
-    data_tar_name = get_data_tar_name('libc6.deb')
-    system(f'ar -x libc6.deb {data_tar_name}')
-    system(f'mkdir -p libc6')
-    if data_tar_name == 'data.tar.xz':
-        system(f'tar -xf {data_tar_name} -C ./libc6')
-    elif data_tar_name == 'data.tar.zst':
-        system(f'zstd -d data.tar.zst -o data.tar')
-        system(f'tar -xf data.tar -C ./libc6')
+    log_info(f"find libc-bin url: {underline(libc_bin_url)}")
 
-    ld_filename = popen(f'find libc6 -name "ld-*.so.*" -type f').read().strip().split('\n')[0]
+    download_result = system(f"wget -q --show-progress {libc_bin_url} -O libc6.deb")
+
+    if download_result != 0 and is_debian:
+        log_fail(
+            f"failed to download Debian binary package, trying alternative mirrors and distributions..."
+        )
+        # Try alternative mirrors and distributions for Debian
+        package_name = "libc6-i386" if amd64_ver_i386 else "libc6"
+        target_arch = arch if not amd64_ver_i386 else "amd64"
+        mirrors_and_dists = [
+            ("http://ftp.debian.org/debian/pool/main/g/glibc", dist),
+            (
+                "http://security.debian.org/debian-security/pool/updates/main/g/glibc",
+                dist,
+            ),
+            ("http://deb.debian.org/debian/pool/main/g/glibc", "sid"),
+            ("http://ftp.debian.org/debian/pool/main/g/glibc", "sid"),
+            ("http://deb.debian.org/debian/pool/main/g/glibc", "trixie"),
+            ("http://ftp.debian.org/debian/pool/main/g/glibc", "trixie"),
+            # Try snapshot.debian.org for older versions
+            (
+                "https://snapshot.debian.org/archive/debian/20250618T082426Z/pool/main/g/glibc",
+                "snapshot",
+            ),
+        ]
+        for mirror, try_dist in mirrors_and_dists:
+            alt_url = f"{mirror}/{package_name}_{version}_{target_arch}.deb"
+            log_info(f"trying mirror ({try_dist}): {underline(alt_url)}")
+            if system(f"wget -q --show-progress {alt_url} -O libc6.deb") == 0:
+                break
+        else:
+            log_fail(f"failed to download from all mirrors and distributions")
+            clean()
+            exit(1)
+
+    data_tar_name = get_data_tar_name("libc6.deb")
+    system(f"ar -x libc6.deb {data_tar_name}")
+    system(f"mkdir -p libc6")
+    if data_tar_name == "data.tar.xz":
+        system(f"tar -xf {data_tar_name} -C ./libc6")
+    elif data_tar_name == "data.tar.zst":
+        system(f"zstd -d data.tar.zst -o data.tar")
+        system(f"tar -xf data.tar -C ./libc6")
+
+    ld_filename = (
+        popen(f'find libc6 -name "ld-*.so.*" -type f').read().strip().split("\n")[0]
+    )
     # print(ld_filename)
-    log_success(f'find ld.so!! at {underline(ld_filename)}')
+    log_success(f"find ld.so!! at {underline(ld_filename)}")
 
-    log_info('Attempting to install symbols for ld.so...')
+    log_info("Attempting to install symbols for ld.so...")
     ld_buildid = get_buildid(ld_filename, fatal=False)
     if ld_buildid:
-        log_info(f'find ld.so buildid: {underline(ld_buildid)}')
+        log_info(f"find ld.so buildid: {underline(ld_buildid)}")
         found_ld_symbol = False
-        potential_files = popen(f'find {dbg_search_dir} -type f').read().strip().split('\n')
+        potential_files = (
+            popen(f"find {dbg_search_dir} -type f").read().strip().split("\n")
+        )
         for f in potential_files:
             if not f:
                 continue
 
             # FIX: Check if the file is an ELF before running get_buildid
             file_type = popen(f'file -b "{f}"').read()
-            if 'ELF' not in file_type:
+            if "ELF" not in file_type:
                 continue
 
             potential_buildid = get_buildid(f, fatal=False)
             if potential_buildid == ld_buildid:
-                log_success('find ld.so dbgsym!!')
+                log_success("find ld.so dbgsym!!")
                 move_dbgysm(f, ld_buildid)
                 found_ld_symbol = True
                 break
         if not found_ld_symbol:
-            log_fail('Could not find matching dbgsym for ld.so.')
+            log_fail("Could not find matching dbgsym for ld.so.")
     else:
-        log_fail("Could not find Build ID for ld.so. Skipping symbol installation for it.")
+        log_fail(
+            "Could not find Build ID for ld.so. Skipping symbol installation for it."
+        )
 
     system(f'cp "{ld_filename}" ../')
-    clean()
+    clean(version)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        print('Download libc dbgsym and ld.so')
-        print(f'Usage: python3 {sys.argv[0]} <target_libc.so>')
+    if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ["-h", "--help"]):
+        print("dbgsym_modified v2.0 - Download libc debug symbols and ld.so")
+        print("Supports both Ubuntu and Debian glibc packages")
+        print("")
+        print(f"Usage: {sys.argv[0]} <target_libc.so>")
+        print("")
+        print("Features:")
+        print("  • Automatic Ubuntu/Debian detection")
+        print("  • Multiple fallback mirrors")
+        print("  • Historical version support via snapshot.debian.org")
+        print("  • Build ID verification")
+        print("")
+        print("Examples:")
+        print(f"  {sys.argv[0]} /lib/x86_64-linux-gnu/libc.so.6")
+        print(f"  {sys.argv[0]} ./libc.so.6")
+        print("")
+        print("Supported distributions:")
+        print("  Ubuntu: All releases via Launchpad")
+        print("  Debian: bookworm, bullseye, buster, sid, trixie + historical")
+    elif len(sys.argv) == 2 and sys.argv[1] in ["-v", "--version"]:
+        print("dbgsym_modified v2.0")
+        print("Enhanced version with Debian support")
     else:
         set_libc_env(sys.argv[1])
