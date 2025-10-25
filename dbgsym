@@ -380,7 +380,7 @@ def set_libc_env(filename):
         system(f"tar -xf data.tar -C ./libc6")
 
     ld_filename = (
-        popen(f'find libc6 -name "ld-*.so.*" -type f').read().strip().split("\n")[0]
+        popen(f'find libc6 -name "ld-*.so*" -type f').read().strip().split("\n")[0]
     )
     # print(ld_filename)
     log_success(f"find ld.so!! at {underline(ld_filename)}")
