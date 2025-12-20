@@ -1,7 +1,7 @@
 #!/usr/bin/env -vS python3
 import requests
 import re
-from os import system, popen, chdir, environ
+from os import system, popen, chdir, environ, path
 import sys
 from pwn import pause
 
@@ -64,6 +64,31 @@ def set_libc_env(filename):
                 log_fail(f"can't find buildid for {filename}")
                 exit(1)
             return None
+
+    def find_dbgsym_by_buildid(buildid, search_dir):
+        if not buildid:
+            return ""
+
+        buildid_path = (
+            f"{search_dir}/usr/lib/debug/.build-id/{buildid[:2]}/{buildid[2:]}.debug"
+        )
+        if path.exists(buildid_path):
+            return buildid_path
+
+        # Fallback: some packages may store debug files elsewhere.
+        candidates = (
+            popen(
+                f'find "{search_dir}" -type f \\( -name "{buildid[2:]}.debug" -o -name "libc-*.so" \\)'
+            )
+            .read()
+            .strip()
+        )
+        for candidate in candidates.splitlines():
+            if not candidate:
+                continue
+            if get_buildid(candidate, fatal=False) == buildid:
+                return candidate
+        return ""
 
     def is_debian_version(ver):
         """Check if this is a Debian version based on version string pattern"""
@@ -268,16 +293,16 @@ def set_libc_env(filename):
         system(f"tar -xf data_dbg.tar -C ./libc6-dbg")
 
     dbg_search_dir = "libc6-dbg"
-    dbgsym_filename = (
-        popen(
-            f'find {dbg_search_dir} -name "libc-*.so" -or -name "{buildid[2:]}.debug" -type f | grep -v prof'
-        )
-        .read()
-        .strip()
-    )
-    dbg_buildid = get_buildid(dbgsym_filename)
+    dbgsym_filename = find_dbgsym_by_buildid(buildid, dbg_search_dir)
+    if not dbgsym_filename:
+        dbg_buildid = ""
+        log_fail(f"can't find dbgsym for buildid: {underline(buildid)}")
+    else:
+        dbg_buildid = get_buildid(dbgsym_filename)
+
     if dbg_buildid != buildid:
-        log_fail(f"dbgsym buildid not match: {underline(dbg_buildid)}")
+        if dbg_buildid:
+            log_fail(f"dbgsym buildid not match: {underline(dbg_buildid)}")
         if arch != "i386":
             clean()
             exit(1)
